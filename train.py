@@ -20,11 +20,16 @@ import torchvision
 import torchvision.transforms as transforms
 
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+# from torch.utils.tensorboard import SummaryWriter
 
 from conf import settings
 from utils import get_network, get_training_dataloader, get_test_dataloader, WarmUpLR, \
     most_recent_folder, most_recent_weights, last_epoch, best_acc_weights
+
+# add horovod imports
+import horovod.torch as hvd
+import torch.backends.cudnn as cudnn
+import torch.multiprocessing as mp
 
 def train(epoch):
 
@@ -45,37 +50,46 @@ def train(epoch):
         n_iter = (epoch - 1) * len(cifar100_training_loader) + batch_index + 1
 
         last_layer = list(net.children())[-1]
-        for name, para in last_layer.named_parameters():
-            if 'weight' in name:
-                writer.add_scalar('LastLayerGradients/grad_norm2_weights', para.grad.norm(), n_iter)
-            if 'bias' in name:
-                writer.add_scalar('LastLayerGradients/grad_norm2_bias', para.grad.norm(), n_iter)
 
-        print('Training Epoch: {epoch} [{trained_samples}/{total_samples}]\tLoss: {:0.4f}\tLR: {:0.6f}'.format(
-            loss.item(),
-            optimizer.param_groups[0]['lr'],
-            epoch=epoch,
-            trained_samples=batch_index * args.b + len(images),
-            total_samples=len(cifar100_training_loader.dataset)
-        ))
+        trained_samples = batch_index * args.b + len(images)
+        # for name, para in last_layer.named_parameters():
+        #     if 'weight' in name:
+        #         writer.add_scalar('LastLayerGradients/grad_norm2_weights', para.grad.norm(), n_iter)
+        #     if 'bias' in name:
+        #         writer.add_scalar('LastLayerGradients/grad_norm2_bias', para.grad.norm(), n_iter)
+        # if hvd.rank()==0:
+        #     print('Training Epoch: {epoch} [{trained_samples}/{total_samples}]\tLoss: {:0.4f}\tLR: {:0.6f}'.format(
+        #         loss.item(),
+        #         optimizer.param_groups[0]['lr'],
+        #         epoch=epoch,
+        #         trained_samples=batch_index * args.b + len(images),
+        #         total_samples=len(cifar100_training_loader.dataset)
+        #     ))
 
         #update training loss for each iteration
-        writer.add_scalar('Train/loss', loss.item(), n_iter)
+        # writer.add_scalar('Train/loss', loss.item(), n_iter)
 
-        if epoch <= args.warm:
-            warmup_scheduler.step()
+        # if epoch <= args.warm:
+        #     adjust_lr_warmup(epoch)
+        #     # warmup_scheduler.step()
 
-    for name, param in net.named_parameters():
-        layer, attr = os.path.splitext(name)
-        attr = attr[1:]
-        writer.add_histogram("{}/{}".format(layer, attr), param, epoch)
+    # for name, param in net.named_parameters():
+    #     layer, attr = os.path.splitext(name)
+    #     attr = attr[1:]
+    #     writer.add_histogram("{}/{}".format(layer, attr), param, epoch)
 
     finish = time.time()
-
-    print('epoch {} training time consumed: {:.2f}s'.format(epoch, finish - start))
+    if hvd.rank()==0:
+        print('Training Epoch: {epoch}\tLoss: {:0.4f}\tLR: {:0.6f}'.format(
+                loss.item(),
+                optimizer.param_groups[0]['lr'],
+                epoch=epoch
+            ))  
+        print('epoch {} training time consumed: {:.2f}s\tThroughput: {:.2f} imgs/sec/GPU'.format(epoch, finish - start, trained_samples / (finish - start)))
+    return trained_samples / (finish - start)
 
 @torch.no_grad()
-def eval_training(epoch=0, tb=True):
+def eval_training(epoch=0, tb=False):
 
     start = time.time()
     net.eval()
@@ -98,16 +112,17 @@ def eval_training(epoch=0, tb=True):
 
     finish = time.time()
     if args.gpu:
-        print('GPU INFO.....')
-        print(torch.cuda.memory_summary(), end='')
-    print('Evaluating Network.....')
-    print('Test set: Epoch: {}, Average loss: {:.4f}, Accuracy: {:.4f}, Time consumed:{:.2f}s'.format(
-        epoch,
-        test_loss / len(cifar100_test_loader.dataset),
-        correct.float() / len(cifar100_test_loader.dataset),
-        finish - start
-    ))
-    print()
+        if hvd.rank()==0:
+            # print('GPU INFO.....')
+            # print(torch.cuda.memory_summary(), end='')
+            print('Evaluating Network.....')
+            print('Test set: Epoch: {}, Average loss: {:.4f}, Accuracy: {:.4f}%, Time consumed:{:.2f}s'.format(
+            epoch,
+            test_loss / len(cifar100_test_loader.dataset),
+            100.0 * (correct.float() / len(cifar100_test_loader.dataset)),
+            finish - start
+            ))
+            print()
 
     #add informations to tensorboard
     if tb:
@@ -115,6 +130,18 @@ def eval_training(epoch=0, tb=True):
         writer.add_scalar('Test/Accuracy', correct.float() / len(cifar100_test_loader.dataset), epoch)
 
     return correct.float() / len(cifar100_test_loader.dataset)
+
+def adjust_lr(epoch):
+    if epoch < 60:
+        lr_adj = 1.
+    elif epoch < 120:
+        lr_adj = 0.2
+    elif epoch < 160:
+        lr_adj = 0.2^2
+    else:
+        lr_adj *= 0.2^3
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = args.lr * hvd.size() * lr_adj
 
 if __name__ == '__main__':
 
@@ -125,7 +152,28 @@ if __name__ == '__main__':
     parser.add_argument('-warm', type=int, default=1, help='warm up training phase')
     parser.add_argument('-lr', type=float, default=0.1, help='initial learning rate')
     parser.add_argument('-resume', action='store_true', default=False, help='resume training')
+    parser.add_argument('-epochs', type=int, default=200, help='epochs')
     args = parser.parse_args()
+
+    # initialize horovod
+    hvd.init()
+    torch.manual_seed(42)
+
+    if args.gpu:
+        torch.cuda.set_device(hvd.local_rank())
+        torch.cuda.manual_seed(42)
+
+    cudnn.benchmark = True
+
+    # Horovod: limit # of CPU threads to be used per worker.
+    torch.set_num_threads(4)
+
+    kwargs = {'num_workers': 4, 'pin_memory': True}
+    # When supported, use 'forkserver' to spawn dataloader workers instead of 'fork' to prevent
+    # issues with Infiniband implementations that are not fork-safe
+    if (kwargs.get('num_workers', 0) > 0 and hasattr(mp, '_supports_context') and
+            mp._supports_context and 'forkserver' in mp.get_all_start_methods()):
+        kwargs['multiprocessing_context'] = 'forkserver'
 
     net = get_network(args)
 
@@ -133,24 +181,38 @@ if __name__ == '__main__':
     cifar100_training_loader = get_training_dataloader(
         settings.CIFAR100_TRAIN_MEAN,
         settings.CIFAR100_TRAIN_STD,
-        num_workers=4,
         batch_size=args.b,
-        shuffle=True
+        shuffle=False,
+        **kwargs
     )
 
     cifar100_test_loader = get_test_dataloader(
         settings.CIFAR100_TRAIN_MEAN,
         settings.CIFAR100_TRAIN_STD,
-        num_workers=4,
         batch_size=args.b,
-        shuffle=True
+        shuffle=False,
+        **kwargs
     )
 
     loss_function = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
-    train_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=settings.MILESTONES, gamma=0.2) #learning rate decay
+
+    if args.gpu:
+        net = net.cuda()
+        loss_function = loss_function.cuda()
+    
+    lr_scaler = hvd.size()
+    
+    optimizer = optim.SGD(net.parameters(), lr=(args.lr * lr_scaler), momentum=0.9, weight_decay=5e-4)
+    # Horovod: wrap optimizer with DistributedOptimizer.
+    optimizer = hvd.DistributedOptimizer(
+        optimizer, named_parameters=net.named_parameters(),
+        compression=hvd.Compression.none,
+        op=hvd.Average
+    )
+
+    # train_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=settings.MILESTONES, gamma=0.2) #learning rate decay
     iter_per_epoch = len(cifar100_training_loader)
-    warmup_scheduler = WarmUpLR(optimizer, iter_per_epoch * args.warm)
+    # warmup_scheduler = WarmUpLR(optimizer, iter_per_epoch * args.warm)
 
     if args.resume:
         recent_folder = most_recent_folder(os.path.join(settings.CHECKPOINT_PATH, args.net), fmt=settings.DATE_FORMAT)
@@ -163,22 +225,22 @@ if __name__ == '__main__':
         checkpoint_path = os.path.join(settings.CHECKPOINT_PATH, args.net, settings.TIME_NOW)
 
     #use tensorboard
-    if not os.path.exists(settings.LOG_DIR):
-        os.mkdir(settings.LOG_DIR)
+    # if not os.path.exists(settings.LOG_DIR):
+    #     os.mkdir(settings.LOG_DIR)
 
     #since tensorboard can't overwrite old values
     #so the only way is to create a new tensorboard log
-    writer = SummaryWriter(log_dir=os.path.join(
-            settings.LOG_DIR, args.net, settings.TIME_NOW))
-    input_tensor = torch.Tensor(1, 3, 32, 32)
-    if args.gpu:
-        input_tensor = input_tensor.cuda()
-    writer.add_graph(net, input_tensor)
+    # writer = SummaryWriter(log_dir=os.path.join(
+    #         settings.LOG_DIR, args.net, settings.TIME_NOW))
+    # input_tensor = torch.Tensor(1, 3, 32, 32)
+    # if args.gpu:
+    #     input_tensor = input_tensor.cuda()
+    # writer.add_graph(net, input_tensor)
 
     #create checkpoint folder to save model
-    if not os.path.exists(checkpoint_path):
-        os.makedirs(checkpoint_path)
-    checkpoint_path = os.path.join(checkpoint_path, '{net}-{epoch}-{type}.pth')
+    # if not os.path.exists(checkpoint_path):
+    #     os.makedirs(checkpoint_path)
+    # checkpoint_path = os.path.join(checkpoint_path, '{net}-{epoch}-{type}.pth')
 
     best_acc = 0.0
     if args.resume:
@@ -201,28 +263,39 @@ if __name__ == '__main__':
         resume_epoch = last_epoch(os.path.join(settings.CHECKPOINT_PATH, args.net, recent_folder))
 
 
-    for epoch in range(1, settings.EPOCH + 1):
-        if epoch > args.warm:
-            train_scheduler.step(epoch)
+    # Horovod: broadcast parameters & optimizer state.
+    hvd.broadcast_parameters(net.state_dict(), root_rank=0)
+    hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+
+    img_sec_GPU = 0.0
+    for epoch in range(1, args.epochs + 1):
+        # if epoch > args.warm:
+        #     adjust_lr(epoch)
+        adjust_lr(epoch)
 
         if args.resume:
             if epoch <= resume_epoch:
                 continue
 
-        train(epoch)
+        cur_tp = train(epoch)
+        img_sec_GPU += cur_tp
         acc = eval_training(epoch)
 
+        
+
         #start to save best performance model after learning rate decay to 0.01
-        if epoch > settings.MILESTONES[1] and best_acc < acc:
-            weights_path = checkpoint_path.format(net=args.net, epoch=epoch, type='best')
-            print('saving weights file to {}'.format(weights_path))
-            torch.save(net.state_dict(), weights_path)
-            best_acc = acc
-            continue
+        # if epoch > settings.MILESTONES[1] and best_acc < acc:
+        #     weights_path = checkpoint_path.format(net=args.net, epoch=epoch, type='best')
+        #     print('saving weights file to {}'.format(weights_path))
+        #     torch.save(net.state_dict(), weights_path)
+        #     best_acc = acc
+        #     continue
 
-        if not epoch % settings.SAVE_EPOCH:
-            weights_path = checkpoint_path.format(net=args.net, epoch=epoch, type='regular')
-            print('saving weights file to {}'.format(weights_path))
-            torch.save(net.state_dict(), weights_path)
+        # if not epoch % settings.SAVE_EPOCH:
+        #     weights_path = checkpoint_path.format(net=args.net, epoch=epoch, type='regular')
+        #     print('saving weights file to {}'.format(weights_path))
+        #     torch.save(net.state_dict(), weights_path)
 
-    writer.close()
+    # writer.close()
+    if hvd.rank() == 0:
+        print("Average imgs per GPU: {:.2f}".format(img_sec_GPU/args.epochs))
