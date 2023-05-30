@@ -31,6 +31,9 @@ import horovod.torch as hvd
 import torch.backends.cudnn as cudnn
 import torch.multiprocessing as mp
 
+# enable wandb logging
+import wandb
+
 def train(epoch):
 
     start = time.time()
@@ -85,7 +88,18 @@ def train(epoch):
                 optimizer.param_groups[0]['lr'],
                 epoch=epoch
             ))  
-        print('epoch {} training time consumed: {:.2f}s\tThroughput: {:.2f} imgs/sec/GPU'.format(epoch, finish - start, trained_samples / (finish - start)))
+        print('epoch {} training time consumed: {:.2f}s\tTrained samples: {} imgs\tThroughput: {:.2f} imgs/sec/GPU'.format(epoch, finish - start, trained_samples, trained_samples / (finish - start)))
+        wandb.log(
+            {
+                "GPU": hvd.rank(),
+                "train/epoch": epoch,
+                "train/loss": loss.item(),
+                "train/lr": optimizer.param_groups[0]['lr'],
+                "train/time_per_epoch": finish - start, 
+                "train/samples_per_epoch": trained_samples,
+                "train/imgs_sec_GPU": trained_samples / (finish - start)
+            }
+        )
     return trained_samples / (finish - start)
 
 @torch.no_grad()
@@ -124,6 +138,15 @@ def eval_training(epoch=0, tb=False):
             ))
             print()
 
+            wandb.log(
+                {
+                    "val/epoch": epoch,
+                    "val/avg_loss": test_loss / len(cifar100_test_loader.dataset),
+                    "val/acc": 100.0 * (correct.float() / len(cifar100_test_loader.dataset)),
+                    "val/time_per_epoch": finish - start
+                }
+            )
+
     #add informations to tensorboard
     if tb:
         writer.add_scalar('Test/Average loss', test_loss / len(cifar100_test_loader.dataset), epoch)
@@ -137,9 +160,9 @@ def adjust_lr(epoch):
     elif epoch < 120:
         lr_adj = 0.2
     elif epoch < 160:
-        lr_adj = 0.2^2
+        lr_adj = 0.04
     else:
-        lr_adj *= 0.2^3
+        lr_adj = 0.008
     for param_group in optimizer.param_groups:
         param_group['lr'] = args.lr * hvd.size() * lr_adj
 
@@ -153,6 +176,13 @@ if __name__ == '__main__':
     parser.add_argument('-lr', type=float, default=0.1, help='initial learning rate')
     parser.add_argument('-resume', action='store_true', default=False, help='resume training')
     parser.add_argument('-epochs', type=int, default=200, help='epochs')
+    parser.add_argument('-momentum', type=float, default=0.9, help='Nesterov momentum')
+    parser.add_argument('-weight-decay', type=float, default=5e-4, help='weight decay')
+
+
+    # MVAPICH2 related compression args
+    parser.add_argument('-cr', type=int, default=0, help='MV2 compression rate')
+    parser.add_argument('-mv2', type=str, default="default_tuned", help="MV2 mode")
     args = parser.parse_args()
 
     # initialize horovod
@@ -202,7 +232,7 @@ if __name__ == '__main__':
     
     lr_scaler = hvd.size()
     
-    optimizer = optim.SGD(net.parameters(), lr=(args.lr * lr_scaler), momentum=0.9, weight_decay=5e-4)
+    optimizer = optim.SGD(net.parameters(), lr=(args.lr * lr_scaler), momentum=args.momentum, weight_decay=args.weight_decay)
     # Horovod: wrap optimizer with DistributedOptimizer.
     optimizer = hvd.DistributedOptimizer(
         optimizer, named_parameters=net.named_parameters(),
@@ -267,6 +297,23 @@ if __name__ == '__main__':
     hvd.broadcast_parameters(net.state_dict(), root_rank=0)
     hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
+    if hvd.rank() == 0:
+        wandb.init(
+            project="MPI-allreduce-compression",
+            config={
+                "epochs": args.epochs,
+                "batch_size_per_GPU": args.b,
+                "lr": args.lr,
+                "GPUs": hvd.size(),
+                "net": args.net,
+                "dataset": "CIFAR100",
+                "warmups": args.warm,
+                "mv2_compression_rate": args.cr,
+                "mv2_mode": args.mv2,
+            }
+        )
+        wandb.watch(net, log_freq=100)
+
     img_sec_GPU = 0.0
     for epoch in range(1, args.epochs + 1):
         # if epoch > args.warm:
@@ -298,4 +345,9 @@ if __name__ == '__main__':
 
     # writer.close()
     if hvd.rank() == 0:
-        print("Average imgs per GPU: {:.2f}".format(img_sec_GPU/args.epochs))
+        print("Average imgs per GPU: {:.2f} over {} epochs".format(img_sec_GPU/args.epochs, args.epochs))
+        wandb.log(
+            {
+                "summary/throughput": img_sec_GPU/args.epochs,
+            }
+        )
